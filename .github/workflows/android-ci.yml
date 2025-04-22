@@ -1,1 +1,296 @@
-0
+# .github/workflows/build-android.yml
+name: CI Cordova Android (Gitpod Style Build)
+
+on:
+  # Déclenche le workflow manuellement depuis l'onglet "Actions" de GitHub
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type (release is only signed option)'
+        type: choice
+        options:
+        - debug # Optionally keep debug, though release is the goal
+        - release
+        default: release # Default to release build
+      cordova_platform:
+        description: 'Cordova Platform'
+        type: choice
+        options:
+        - android
+        default: android
+
+env:
+  # Variables d'environnement (basées sur votre .gitpod.yml et Dockerfile)
+  NODE_VERSION: '18' # ou '16' si vous préférez
+  JAVA_VERSION: '17'
+  ANDROID_BUILD_TOOLS_VERSION: '34.0.0'
+  ANDROID_PLATFORM_VERSION: 'android-34' # ou 'android-33' si votre config.xml cible plus bas
+  CORDOVA_ANDROID_VERSION: '12.0.1' # Doit correspondre à config.xml et votre installation
+  # Options pour le build Gradle
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx4096m -Dkotlin.daemon.jvm.options=-Xmx4096m"'
+  # Propriétés pour gradle.properties (correspondant à votre script Gitpod)
+  ANDROID_GRADLE_PROPERTIES: |
+    android.useAndroidX=true
+    android.enableJetifier=true
+    org.gradle.jvmargs=-Xmx4096m
+    android.suppressUnsupportedCompileSdk=34
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4 # Utilise la dernière version de l'action
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4 # Utilise la dernière version de l'action
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Dependencies
+        run: |
+          # Installez Cordova globalement à la version spécifique que vous utilisez (12.x)
+          # Utiliser npx par la suite garantira l'exécution de la version installée
+          npm install -g cordova@${{ env.CORDOVA_ANDROID_VERSION %.0.1 }} # Installe cordova CLI 12.x si cordova-android est 12.0.1 (enlève juste le .0.1 pour trouver la CLI)
+          npm install # Installe les dépendances de votre projet (plugins, etc.)
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4 # Utilise la dernière version de l'action
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # Utilise une action pour configurer le SDK Android, plus propre que le script manuel dans GH Actions
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3 # Utilise la dernière version de cette action tierce
+        with:
+          api-level: ${{ env.ANDROID_PLATFORM_VERSION | replace('android-', '') }} # Extrait le numéro d'API (ex: 34)
+          build-tools: ${{ env.ANDROID_BUILD_TOOLS_VERSION }}
+          # L'action gère normalement l'installation des plateformes et l'acceptation des licences
+
+      - name: Add Cordova Platform ${{ inputs.cordova_platform }}@${{ env.CORDOVA_ANDROID_VERSION }}
+        run: npx cordova platform add ${{ inputs.cordova_platform }}@${{ env.CORDOVA_ANDROID_VERSION }} --no-save # --no-save si la plateforme est déjà dans config.xml
+
+      - name: Configure Gradle (based on .gitpod setup)
+        run: |
+          # Écrire les propriétés Gradle supplémentaires
+          echo "${{ env.ANDROID_GRADLE_PROPERTIES }}" > platforms/android/gradle.properties
+          cat platforms/android/gradle.properties # Afficher pour vérification
+
+          # Mettre à jour/Créer le wrapper Gradle (comme dans votre script Gitpod)
+          # Cela peut être nécessaire pour forcer une version spécifique ou régénérer les scripts
+          if [ -d "platforms/android" ]; then
+            echo "Updating Gradle wrapper to version 8.4..."
+            cd platforms/android
+            chmod +x ./gradlew # S'assurer qu'il est exécutable si déjà présent
+
+            # Tenter de mettre à jour le wrapper existant ou en créer un si nécessaire
+            # Le --distribution-type all est nécessaire pour le build
+            ./gradlew wrapper --gradle-version 8.4 --distribution-type all || {
+              echo "Gradle wrapper update/creation failed, attempting manual download/creation."
+              # Si l'update échoue (par ex si le wrapper n'existait pas ou permission), essayer de créer/télécharger manuellement
+              mkdir -p gradle/wrapper
+              # Vous pouvez copier les fichiers gradlew et gradle-wrapper.jar/properties depuis un projet fonctionnel ou les télécharger
+              # Cette partie est la plus fragile et dépend de l'état initial. Une solution robuste serait de les commiter dans votre repo.
+              # Si vous avez commité gradlew et gradle/wrapper/*, cette étape n'est pas strictement nécessaire sauf si vous voulez forcer la version 8.4
+
+              # Exemple de création manuelle si gradlew n'est pas commité:
+              curl -L https://github.com/gradle/wrapper/raw/master/gradle/wrapper/gradle-wrapper.jar -o gradle/wrapper/gradle-wrapper.jar
+              curl -L https://raw.githubusercontent.com/gradle/gradle/master/gradlew -o gradlew
+              chmod +x gradlew
+              cat > gradle/wrapper/gradle-wrapper.properties << EOL
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https://services.gradle.org/distributions/gradle-8.4-all.zip
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+EOL
+            }
+            cd ../..
+          fi
+        shell: bash # S'assurer que l'on utilise bash pour la syntaxe shell
+
+      - name: Prepare Cordova (Sync Plugins/Platform)
+        run: npx cordova prepare ${{ inputs.cordova_platform }}
+
+
+      # --- Build Step (using Gradle Wrapper directly) ---
+      # Exécute la tâche 'assembleRelease' via le wrapper Gradle
+
+      - name: Build Android Release using Gradle Wrapper
+        if: inputs.build_type == 'release'
+        run: |
+          cd platforms/android
+          # Exécute la tâche assembleRelease (qui génère l'APK/AAB non signé)
+          # Utilise les options JVM et Gradle définies
+          ./gradlew assembleRelease ${{ env.GRADLE_OPTS }} --info
+          cd ../..
+        shell: bash # Important pour les variables d'environnement et l'exécution du script
+
+      # --- Signing Step (Manual, based on .gitpod command) ---
+      # Requiert build_type == 'release' ET les secrets de signature
+
+      - name: Decode Keystore File
+        # Exécute uniquement pour le build de release si les secrets de signature existent
+        if: |
+          inputs.build_type == 'release' &&
+          secrets.ANDROID_KEYSTORE_BASE64 != '' &&
+          secrets.ANDROID_KEYSTORE_PASSWORD != '' &&
+          secrets.ANDROID_KEY_ALIAS != '' &&
+          secrets.ANDROID_KEY_PASSWORD != ''
+        run: |
+          # Crée le répertoire 'certificates' comme dans votre script Gitpod
+          mkdir -p certificates
+          # Décode le fichier keystore Base64 depuis le secret et le sauvegarde
+          # **ASSUREZ-VOUS QUE LE NOM DU FICHIER (android.p12) CORRESPOND À CELUI UTILISÉ CI-DESSOUS ET DANS build.json si vous l'utilisez pour d'autres outils**
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > certificates/android.p12
+          echo "Keystore decoded to certificates/android.p12"
+        shell: bash # S'assurer que l'on utilise bash
+        # Ajoutez une vérification pour s'assurer que le fichier a été créé
+      - name: Verify Keystore File
+        if: |
+          inputs.build_type == 'release' &&
+          secrets.ANDROID_KEYSTORE_BASE64 != '' &&
+          secrets.ANDROID_KEYSTORE_PASSWORD != '' &&
+          secrets.ANDROID_KEY_ALIAS != '' &&
+          secrets.ANDROID_KEY_PASSWORD != ''
+        run: |
+          ls -la certificates/android.p12
+          echo "Keystore file exists and has permissions."
+        shell: bash
+
+      - name: Sign and Align APK/AAB manually
+        # Exécute uniquement pour le build de release si les secrets de signature existent
+        if: |
+          inputs.build_type == 'release' &&
+          secrets.ANDROID_KEYSTORE_BASE64 != '' &&
+          secrets.ANDROID_KEYSTORE_PASSWORD != '' &&
+          secrets.ANDROID_KEY_ALIAS != '' &&
+          secrets.ANDROID_KEY_PASSWORD != ''
+        run: |
+          # Définir les variables de secrets pour le script shell (NE PAS les exposer aux logs avec echo simple!)
+          export STOREPASS="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+          export KEYPASS="${{ secrets.KEY_PASSWORD }}" # Utilise KEY_PASSWORD car KEYPASS n'est pas standard pour les secrets
+          export KEYALIAS="${{ secrets.ANDROID_KEY_ALIAS }}"
+
+          # Trouver le chemin de l'APK/AAB non signé généré par Gradle
+          # Le nom de fichier et l'extension peuvent varier (apk, aab)
+          UNSIGNED_ARTIFACT=$(find platforms/android/app/build/outputs -name "app-release-unsigned.*" | head -n 1)
+
+          if [ -z "$UNSIGNED_ARTIFACT" ]; then
+            echo "❌ Error: Unsigned release artifact not found!"
+            exit 1
+          fi
+
+          echo "Found unsigned artifact: $UNSIGNED_ARTIFACT"
+          ls -la "$UNSIGNED_ARTIFACT" # Afficher pour debug
+
+          # Trouver les chemins de zipalign et apksigner dans les build-tools
+          # Recherche la version la plus récente si 34.0.0 n'est pas trouvée
+          BUILD_TOOLS_DIR=$(find ${ANDROID_SDK_ROOT}/build-tools -maxdepth 1 -mindepth 1 -type d | sort -r | head -1)
+
+          if [ -z "$BUILD_TOOLS_DIR" ]; then
+             echo "❌ Error: Android build tools not found in ${ANDROID_SDK_ROOT}/build-tools!"
+             exit 1
+          fi
+
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+
+          if [ ! -f "$ZIPALIGN" ]; then
+            echo "❌ Error: zipalign not found at ${ZIPALIGN}"
+            exit 1
+          fi
+          if [ ! -f "$APKSIGNER" ]; then
+            echo "❌ Error: apksigner not found at ${APKSIGNER}"
+            exit 1
+          fi
+
+          echo "Using zipalign from: $ZIPALIGN"
+          echo "Using apksigner from: $APKSIGNER"
+
+
+          # Définir le nom du fichier de sortie signé
+          SIGNED_ARTIFACT_NAME=$(basename "$UNSIGNED_ARTIFACT" | sed 's/-unsigned//') # Retire '-unsigned' du nom
+          SIGNED_ARTIFACT_PATH="./${SIGNED_ARTIFACT_NAME}" # Chemin de sortie dans le répertoire courant du runner
+
+          echo "Running zipalign..."
+          # Zipalign l'artefact non signé vers le fichier de sortie temporaire
+          "$ZIPALIGN" -v -p 4 "$UNSIGNED_ARTIFACT" "$SIGNED_ARTIFACT_PATH.aligned"
+
+          if [ ! -f "$SIGNED_ARTIFACT_PATH.aligned" ]; then
+              echo "❌ Error: Zipalign failed. Aligned artifact not created."
+              exit 1
+          fi
+
+          echo "Running apksigner..."
+          # Signe le fichier aligné
+          "$APKSIGNER" sign \
+            --ks certificates/android.p12 \
+            --ks-pass pass:"$STOREPASS" \
+            --key-pass pass:"$KEYPASS" \
+            --ks-key-alias "$KEYALIAS" \
+            --ks-type PKCS12 \
+            "$SIGNED_ARTIFACT_PATH.aligned"
+
+          SIGNING_EXIT_CODE=$?
+
+          if [ $SIGNING_EXIT_CODE -eq 0 ]; then
+            echo "✅ Signing successful!"
+            # Renommer le fichier final aligné et signé
+            mv "$SIGNED_ARTIFACT_PATH.aligned" "$SIGNED_ARTIFACT_PATH"
+            echo "Final signed artifact created at: $SIGNED_ARTIFACT_PATH"
+            ls -la "$SIGNED_ARTIFACT_PATH"
+            # Rendre le chemin disponible pour l'étape suivante d'upload
+            echo "::set-output name=signed_artifact_path::${SIGNED_ARTIFACT_PATH}"
+          else
+            echo "❌ Signing failed with exit code $SIGNING_EXIT_CODE."
+            # Supprimer le fichier aligné s'il existe pour éviter de télécharger un artefact incomplet/non signé
+            [ -f "$SIGNED_ARTIFACT_PATH.aligned" ] && rm "$SIGNED_ARTIFACT_PATH.aligned"
+            exit $SIGNING_EXIT_CODE # Faire échouer l'étape
+          fi
+        shell: bash # S'assurer que l'on utilise bash pour la syntaxe shell et les variables d'environnement sécurisées
+
+      # --- Upload Artifact Step ---
+
+      - name: List output files (for debug)
+        run: ls -l platforms/android/app/build/outputs/
+        if: always() # Toujours afficher la liste pour le debug
+        shell: bash
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4 # Utilise la dernière version de l'action
+        # Exécute uniquement si le build est de release ET si l'étape de signature a réussi
+        if: |
+          inputs.build_type == 'release' &&
+          success() &&
+          steps.Sign and Align APK/AAB manually.outputs.signed_artifact_path != '' # Vérifie que l'étape précédente a généré le chemin de sortie
+
+        with:
+          name: xobucks-android-release # Nom de l'artefact
+          path: ${{ steps.Sign and Align APK/AAB manually.outputs.signed_artifact_path }} # Chemin de l'artefact signé
+
+
+      # --- Fallback pour Uploader l'APK de Debug ou l'APK/AAB de Release NON signé si le build a réussi mais pas la signature ---
+      - name: Upload Debug or Unsigned Release Artifact (Fallback)
+        uses: actions/upload-artifact@v4
+        # Exécute si le build global (gradlew) a réussi, MAIS l'étape de signature n'a PAS eu lieu ou a échoué
+        # Permet d'uploader l'APK de debug ou l'APK/AAB de release NON signé pour inspection/debug
+        if: |
+           success() && (
+           inputs.build_type == 'debug' || # Si c'est un build debug (pas de signature)
+           (inputs.build_type == 'release' && (
+             steps.Sign and Align APK/AAB manually.conclusion != 'success' || # Si l'étape de signature n'a pas réussi
+             steps.Sign and Align APK/AAB manually.outputs.signed_artifact_path == '' # Ou si l'étape de signature n'a pas produit de chemin (erreur logique, etc.)
+           ))
+           )
+        with:
+          name: xobucks-android-${{ inputs.build_type }}-unsigned # Nom de l'artefact (debug ou release-unsigned)
+          # Trouver le chemin de l'artefact de sortie (debug ou release non signé)
+          path: |
+            ${{ inputs.build_type == 'debug' && 'platforms/android/app/build/outputs/apk/debug/app-debug.apk' || '' }}
+            ${{ inputs.build_type == 'release' && 'platforms/android/app/build/outputs/apk/release/app-release-unsigned.apk' || '' }}
+            ${{ inputs.build_type == 'release' && 'platforms/android/app/build/outputs/bundle/release/app-release-unsigned.aab' || '' }}
+          # On liste les chemins possibles, l'action upload-artifact gérera s'ils existent ou non
+
